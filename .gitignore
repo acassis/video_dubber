@@ -1,0 +1,8 @@
+dubber
+__pycache__/
+*.pyc
+*.work/
+*.mp4
+*.wav
+*.jsonl
+*.log
