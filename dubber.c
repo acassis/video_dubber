@@ -602,7 +602,7 @@ static const char *transcribe(const char *audio, char *srt, size_t n)
 	snprintf(srt, n, "%s/orig.srt", opt.workdir);
 	snprintf(json, sizeof json, "%s/orig.json", opt.workdir);
 	snprintf(keyf, sizeof keyf, "%s/asr.key", opt.workdir);
-	snprintf(key, sizeof key, "words\n%s\n%s\n%s\n%s\n", opt.model,
+	snprintf(key, sizeof key, "clips\n%s\n%s\n%s\n%s\n", opt.model,
 		 opt.source ? opt.source : "auto", audio,
 		 opt.prompt ? opt.prompt : "");
 
