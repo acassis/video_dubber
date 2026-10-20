@@ -141,6 +141,19 @@ stems, the transcript, the translations and the SRT files. Re-running reuses
 finished steps and redoes a step only when its inputs changed. Use `-f` to
 redo everything.
 
+## Running next to a desktop
+
+`--best` needs about 10 GB of RAM, most of it the memory-mapped 12B model.
+To keep the browser safe and keep the job from being OOM-killed:
+
+```sh
+tools/run_limited.sh ./dubber -i talk.mp4 -l en --best
+```
+
+The job then runs in its own systemd user scope, with memory caps and no
+swap, at nice 10. It is paused if free RAM drops below 2 GB, and it prints
+its peak memory at the end. See DESIGN.md §6.1.
+
 ## Measured on an RTX 3050 Ti (4 GB) + 16-core CPU
 
 2-minute clip, Urdu → English + Portuguese: 2 min 14 s end to end, with a

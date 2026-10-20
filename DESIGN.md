@@ -35,7 +35,7 @@ The fixed constraints that shaped every decision:
  separate.py ── BS-RoFormer ──► vocals.wav + background.wav        GPU
      │
      ▼
- asr.py ── faster-whisper turbo + VAD, word timestamps ──► orig.srt  GPU
+ asr.py ── faster-whisper turbo, ≤15 s VAD clips, word timestamps ──► orig.srt  GPU
      │
      ▼  src.txt (one line per segment) + slots.txt (seconds per line)
  translate.py ── Gemma 3 (llama.cpp) [+ LoRA] / NLLB-200 ──► <lang>.txt   GPU
@@ -166,9 +166,31 @@ recognized from the full mix and the original track is muted, or mixed in at
   the same model takes about **4 minutes**.
 * `small` misheard Hindi badly ("fazer um não depois da máquina"), so
   `turbo` is the default.
-* **Silero VAD** (`vad_filter`, 500 ms minimum silence) skips music and
-  noise. Without it, Whisper wrote garbage over YouTube's background music:
-  Korean words, and "बरे बरे बरे…" repeated.
+* **Silero VAD** (500 ms minimum silence) skips music and noise. Without
+  it, Whisper wrote garbage over YouTube's background music: Korean words,
+  and "बरे बरे बरे…" repeated.
+* **Short clips, not 30 s windows.** faster-whisper's own `vad_filter`
+  packs speech into 30 s windows, and Whisper decodes at most 448 tokens
+  per window. Urdu in Arabic script costs several tokens per word, so a
+  window of fast, continuous speech overflows. Its text is cut off
+  mid-word, its word times are spread evenly over the window, and the rest
+  of the window is skipped. In the servo-motor video the first 29 s became
+  one phrase and the speech from 0:29 to 0:38 was lost, so the dub was
+  silent from 0:20 to 0:38 while the speaker talked. The pass was also
+  nondeterministic: different runs lost 20 to 160 s of speech. `asr.py`
+  now cuts the VAD speech at pauses into clips of at most 15 s
+  (`speech_clips()`) and passes them as `clip_timestamps`.
+* **Safety net:** `redo_gaps()` treats a phrase longer than 20 s as an
+  overflowed window. That phrase, and any VAD speech of 1 s or more that no
+  phrase covers, is transcribed again in clips of at most 12 s. Each clip
+  starts 3 s early, because Whisper drops the first words of a clip cut
+  mid-word; words from that lead-in are discarded.
+* **Phrase length:** phrases over 10 s are split at their longest pause,
+  with a bonus for punctuation and a preference for the middle (pieces of
+  at least 3 s). Each piece gets its own start time in the dub.
+  `no_overlaps()` drops a phrase lying mostly inside an earlier one, such
+  as a clip boundary decoded twice or a "شکریہ" ("thank you")
+  hallucination.
 * `condition_on_previous_text=False` prevents one hallucination from
   propagating.
 * **Word timestamps** (cross-attention alignment) are enabled. A segment's
@@ -440,6 +462,11 @@ second video, all 141 start on time and 2 per language were cut short.
   about 8 GB, plus 7.3 GB for the 12B and 3.1 GB for the training base.
 * **YouTube downloads:** the AAC audio stream (format 140) can return HTTP
   403. The Opus stream (format 251) works with `-a`.
+* **Whisper window overflow** on dense Urdu: up to 30 s of speech was
+  silently lost and the dub went quiet while the speaker talked. Fixed by
+  short VAD clips plus re-transcription of gaps (§3.3).
+* **Running next to a desktop:** `tools/run_limited.sh` runs a job in its
+  own systemd user scope (§6.1).
 
 ## 6. Performance (RTX 3050 Ti 4 GB, 16-core CPU)
 
@@ -452,6 +479,27 @@ second video, all 141 start on time and 2 per language were cut short.
 | 55-minute video, en + pt, `--best` (12B pivot) | 56 min (pivot about 43 min) |
 | LoRA training, 93 examples, 3 epochs | 15 min, 3.0 GB VRAM |
 | 10-minute video, en + pt, 4B + LoRA | 13 min first run; 8:52 re-run with `-p` (separation reused) |
+
+### 6.1 Memory: running next to the browser
+
+`--best` maps the 7.3 GB 12B GGUF into memory. Most of it is file-backed
+pages, which the kernel can drop and read again, but the job still
+competes with the desktop. Ubuntu's `systemd-oomd` kills the cgroup under
+`user@1000.service` with the most reclaim activity once memory pressure
+stays above 50% for 20 s. `tools/run_limited.sh CMD…` needs no root:
+
+* It waits until 12 GB is available before starting.
+* It runs the job in its own scope with `MemoryHigh=18G` (above that the
+  job reclaims only its own pages), `MemoryMax=24G` (a runaway job is
+  stopped inside its scope, never the browser) and `MemorySwapMax=0`, at
+  nice 10.
+* A guard freezes the scope (cgroup freezer, nothing is lost) if the
+  system drops below 2 GB available, and thaws it at 5 GB.
+* It prints the scope's peak memory at the end.
+
+A real reservation (`MemoryLow`) is ignored unless every parent cgroup has
+one, and that needs root:
+`sudo systemctl set-property user-1000.slice MemoryLow=16G`.
 
 ## 7. Known limitations
 
@@ -473,9 +521,10 @@ second video, all 141 start on time and 2 per language were cut short.
 |---|---|
 | `dubber.c` | main program: options, device choice, caching, scheduling, TTS fitting, timeline, mux |
 | `separate.py` | voice/background separation (BS-RoFormer) |
-| `asr.py` | faster-whisper transcription with word timestamps → `orig.srt`, `orig.json` |
+| `asr.py` | faster-whisper transcription in short VAD clips with word timestamps, gap re-transcription, phrase splitting → `orig.srt`, `orig.json` |
 | `translate.py` | LLM translator (study, windows, shorten, checks, pivot, LoRA) and NLLB fallback |
 | `tools/train_lora.py` | QLoRA distillation of the 12B into the 4B, GGUF conversion, chrF evaluation |
+| `tools/run_limited.sh` | run a job in a memory-limited systemd user scope, paused when RAM runs low |
 | `fetch_models.sh` | one-time setup: venv, llama.cpp, Whisper, NLLB, Gemma, RoFormer, Piper voices |
 | `Makefile` | `make` builds `dubber` (gcc, C11, `-lm`) |
 
@@ -523,3 +572,7 @@ Model data (`~/.local/share/dubber/`): `venv/`, `voices/`, `separator/`,
    adapter loaded automatically. chrF 50.2 → 59.0.
 5. **Second video** (CNC plasma → laser, 10 min): dubbed with 4B + LoRA;
    "CNC" fixed with `-p`.
+6. **Third video** (servo motors, 6:43): the dub was silent from 0:20 to
+   0:38 because Whisper's window overflowed. ASR now uses short VAD clips,
+   re-transcribes gaps and splits long phrases; `tools/run_limited.sh` was
+   added for memory-safe `--best` runs.
