@@ -3,7 +3,8 @@
 
 usage: asr.py MODEL LANG|auto AUDIO OUTDIR [PROMPT]
 
-Writes OUTDIR/orig.srt and OUTDIR/orig.json ({"language": ..., ...}).
+Writes OUTDIR/orig.srt and OUTDIR/orig.json ({"language": ..., "segments":
+[{"start", "end", "text", "words": [[start, end, word], ...]}, ...]}).
 Device is chosen by DUBBER_DEVICE (auto|cuda|cpu). Models must already be
 in the local HuggingFace cache (see fetch_models.sh).
 
@@ -232,9 +233,15 @@ def main():
                   flush=True)
     n = len(segs)
     with open(os.path.join(outdir, "orig.json"), "w") as f:
+        # word times: speaker turns and lip timing (scene.py) need them
         json.dump({"language": info.language,
                    "language_probability": info.language_probability,
-                   "duration": info.duration}, f)
+                   "duration": info.duration,
+                   "segments": [{"start": s[0][0], "end": s[-1][1],
+                                 "text": words_text(s),
+                                 "words": [[round(w[0], 3), round(w[1], 3),
+                                            w[2].strip()] for w in s]}
+                                for s in segs]}, f, ensure_ascii=False)
     print(f"  {n} segments, language {info.language} "
           f"({info.language_probability:.2f})", file=sys.stderr)
 
