@@ -508,12 +508,15 @@ one, and that needs root:
 * Whisper sometimes splits phrases at odd points, which gives fragment
   lines ("this") whose translation sounds clipped.
 * Culture-specific units are kept as spoken ("twenty-five lakh").
-* One voice per language: speaker identity, gender and emotion are not
-  transferred.
-* When the translation is much longer than the original, speech gets fast
-  (up to 2×). About a quarter of the English lines in the second video
-  needed some speed-up.
-* No lip-sync.
+* Without `--lipsync`: one voice per language, so speaker identity,
+  gender and emotion are not transferred.
+* Without `--lipsync`, speech gets fast (up to 2×) when the translation is
+  much longer than the original. About a quarter of the English lines in
+  the second video needed some speed-up.
+* With `--lipsync`, nothing is sped up, so a line that is still too long is
+  faded out where the next one starts. On dense crosstalk this is about
+  10% of the speech (§11).
+* Lip-matching wording could not be shown to help on medium shots (§11.4).
 
 ## 8. Files
 
@@ -525,7 +528,10 @@ one, and that needs root:
 | `translate.py` | LLM translator (study, windows, shorten, checks, pivot, LoRA) and NLLB fallback |
 | `tools/train_lora.py` | QLoRA distillation of the 12B into the 4B, GGUF conversion, chrF evaluation |
 | `tools/run_limited.sh` | run a job in a memory-limited systemd user scope, paused when RAM runs low |
-| `fetch_models.sh` | one-time setup: venv, llama.cpp, Whisper, NLLB, Gemma, RoFormer, Piper voices |
+| `lips.py` | `--lipsync`: per-frame mouth measurements of every face (MediaPipe) → `lips.npz` |
+| `scene.py` | `--lipsync`: speaker turns, sex, speaking face, lip weight, pitch and loudness per phrase → `scene.json`, `scene.srt` |
+| `lipdub.py` | `--lipsync`: adaptation, Kokoro voices, meaning checks, timeline LP, intonation (PSOLA) → `tts_<lang>/`, `place_<lang>.txt`, `lipsync_<lang>.json` |
+| `fetch_models.sh` | one-time setup: venv, llama.cpp, Whisper, NLLB, Gemma, RoFormer, Piper voices, lip-sync models |
 | `Makefile` | `make` builds `dubber` (gcc, C11, `-lm`) |
 
 Work directory (`<input>.work/`): `source.wav`, `vocals.wav`,
@@ -554,6 +560,8 @@ Model data (`~/.local/share/dubber/`): `venv/`, `voices/`, `separator/`,
 | `DUBBER_NLLB_MODEL` | translate.py | NLLB model name or directory |
 | `DUBBER_SEP_MODEL`, `DUBBER_SEP_MODELS` | separate.py | separation model file and directory |
 | `DUBBER_LORA_EPOCHS`, `DUBBER_LORA_RANK`, `DUBBER_LORA_SKIP_TRAIN` | train_lora.py | training settings |
+| `DUBBER_ADAPT` | lipdub.py | `trim` (default: cut fillers only) or `llm` (experimental LLM rewrites, §11.3) |
+| `DUBBER_FACE_MODEL` | lips.py | MediaPipe face landmarker `.task` file |
 | `DUBBER_LLM_SIZE` | fetch_models.sh | `4b` (default) or `12b` |
 | `DUBBER_VENV`, `DUBBER_VOICES` | fetch_models.sh | install locations |
 
@@ -576,3 +584,154 @@ Model data (`~/.local/share/dubber/`): `venv/`, `voices/`, `separator/`,
    0:38 because Whisper's window overflowed. ASR now uses short VAD clips,
    re-transcribes gaps and splits long phrases; `tools/run_limited.sh` was
    added for memory-safe `--best` runs.
+7. **Lip-sync mode** (`--lipsync`, §11): mouth tracking, speakers and their
+   sex, adaptation without time-stretching, meaning checks, intonation
+   transfer. Tested on a 9.5-minute English TV panel dubbed into Portuguese.
+
+## 11. Lip-sync mode (`--lipsync`)
+
+**Request:** detect the speaker's lips, adapt the translation to them as
+human dubbers do, never change the speed of the audio, carry over the
+intonation, and use a voice of the speaker's sex. A later correction: the
+wording may change to fit, but the translation must never become wrong.
+
+**Literature that shaped it.**
+* Brannon et al. (TACL 2023) measured 319 h of professional dubs. Dubbers
+  keep their speaking rate and adapt the words. Duration (isochrony)
+  matters far more than lip sync, which is a soft constraint even on camera.
+* Isometric MT (Lakew et al. 2022) generates n-best translations and
+  reranks them on length.
+* Chaume: phonetic sync (bilabials, open vowels) matters only in visible
+  close-ups.
+* Prosody transfer at phrase level beats utterance level (Swiatkowski et
+  al. 2023).
+
+### 11.1 Mouths and speakers
+
+* **MediaPipe Face Landmarker** (Tasks API, CPU). It runs during separation
+  and ASR, taking about 7 minutes for 9.5 minutes of 1080p video.
+  * Its detector squeezes the frame to 128×128, so standing presenters (5%
+    of the frame width) were often missed. Two overlapping, nearly square
+    crops raised face coverage in the first minute from 72% to 100%.
+* **Photos on screen** had stable tracks with frozen lips. A face whose
+  lip motion over its whole lifetime stays below 0.012 is ignored. The
+  measured gap: still faces ≤ 0.0063, talking faces ≥ 0.024.
+* **The speaking face** has lips that move at syllable rate (2–8 Hz) with
+  the voice's loudness.
+  * Listeners also move their lips (nods, smiles). Each face therefore
+    belongs to the one speaker whose phrases chose it most strongly.
+* **Speakers:** ECAPA embeddings of 2 s windows, average-linkage clustering
+  at cosine distance 0.75.
+  * At 0.55 there were 28 "speakers"; at 0.75–0.8 there are exactly the 6
+    real voices.
+  * Phrases are split where the speaker changes: 189 → 194.
+* **Sex:** pitch failed. A male analyst's median was 177 Hz and a female
+  host's 161 Hz, and formant spacing did not separate them either. The
+  audeering wav2vec2 age/gender model (6 layers, CC BY-NC-SA) classified
+  all 6 correctly (p(female) 0.77–0.82 for the women, ≤ 0.03 for the men).
+
+### 11.2 Voices and intonation
+
+* **Kokoro-82M** gives each speaker a voice of their sex. Piper has no
+  female pt-BR voice. For a second distinct voice of one sex, two Kokoro
+  style vectors are averaged (e.g. `pf_dora,af_heart`).
+  * Kokoro returns every phoneme's duration (`pred_dur`, units of 600
+    samples), so the viseme timeline of each candidate is exact.
+* **Intonation:** the original pitch contour (Praat, 10 ms) is taken in
+  semitones relative to the speaker's median, smoothed at 0.2 s and mapped
+  onto the clip's time.
+  * The PSOLA resynthesis (Praat Manipulation, overlap-add) replaces the
+    clip's slow contour with it and keeps the voice's micro-prosody and
+    the duration.
+  * Correlation of the dub's melody with the speaker's: **+0.11–0.14 before,
+    +0.83–0.85 after**, on all 194 clips.
+* **Loudness** relative to the speaker's mean is carried over, within ±6 dB.
+
+### 11.3 Adaptation, and why it is now only trimming
+
+* **Spoken at natural speed**, the first translation overruns the next
+  phrase in 118 of 194 lines.
+  * pt-BR needs 1.31× the syllables of the English, while Kokoro already
+    talks faster than these anchors (5.6 against 5.0 syllables/s).
+  * In total, 611 s of Portuguese speech had to fit into a 567 s video.
+* **The meaning checks were measured, not assumed.**
+  * Test set: 32 lines with 100 rewrites, plus 96 deliberately falsified
+    versions (a changed fact, a negation, or the main point left out).
+
+  | Check | Rewrites kept | Falsified kept |
+  |---|---|---|
+  | Gemma 4B asked "same meaning?" | 91% | 47% |
+  | the same, inverse question | 0% | 3% |
+  | NLI both ways ≥ 0.8 (mDeBERTa-v3 XNLI) | 49% | 5% (true errors ~2%) |
+
+* **Reading the output** told a different story from those numbers. I read
+  random samples of the rewrites the gates had accepted:
+  * Free rewrites (NLI + LaBSE): 2 of 8 were wrong. A poll lead ("X plus
+    three") became "X scored three".
+  * Rewrites made only of the first translation's own words: 6 of 28
+    wrong. The model slipped in small words like "sim" and "bem".
+  * Deletion only, plus grammar words: 4 of 18 wrong. Deleting "first …
+    since" from "the first senator elected since 1988" turned it into
+    "elected in 1988".
+  * Back-translating and checking with English NLI did not catch these
+    either.
+
+  Automatic checks catch changed facts and negations but not this kind of
+  idiom or scope error, and the user's rule is that the translation is never
+  wrong.
+* **Default (`DUBBER_ADAPT=trim`):** remove only what cannot carry a fact.
+  * Discourse markers and fillers as whole comma-delimited units or opening
+    the sentence ("então", "bem", "olha", "você sabe", "eu quero dizer",
+    "na verdade", "literalmente").
+  * Subject pronouns opening a clause (pt-BR is pro-drop).
+  * Every combination is spoken and scored, and NLI is kept as a guard.
+* **`DUBBER_ADAPT=llm`** keeps the LLM rewriting rounds (variants with a
+  syllable target and lip hints, then feedback with the measured time),
+  behind the same gates, as an experiment.
+  * On this video it cut half as much speech as trimming (30.7 s against
+    64 s), with about 1 rewrite in 4 subtly wrong.
+  * A human review of its proposals would make it usable.
+  * Gemma 12B only made 8 of 24 over-long lines fit (4B: 5 of 24), and
+    took 10× as long.
+
+### 11.4 Lips: what can and cannot be shown
+
+* **Candidate scoring:** a candidate's visemes (open vowels 1.0, p/b/m 0,
+  f/v 0.12) are correlated with the measured lip opening. The candidate may
+  shift by ±0.1 s to meet the lips.
+* **The ceiling:** on the 27 on-camera lines, the original speaker's own
+  voice loudness correlates with their measured lips at only +0.04 (−0.07
+  on the 8 largest faces). The dubs score +0.03 to +0.06.
+  * On medium shots this measurement is too noisy to show any lip-sync
+    effect, good or bad, so no claim is made.
+  * Lips are used for what is reliable: deciding which lines are on camera.
+    They are held within ±0.15 s of the lips, while off-camera lines may
+    slide into the pauses.
+
+### 11.5 Timeline
+
+`schedule()` is a linear program (HiGHS):
+* **Variables:** each clip's start and how much of it is cut.
+* **Constraints:** no overlap.
+  * On camera: ±0.15 s.
+  * Small or partial faces: −0.4 to +0.6 s.
+  * Off camera: −0.8 to +1.5 s.
+* **Objective:** distance from the original start, weighted by lip weight,
+  plus 20 per second of speech cut.
+* It reduced the cut speech of the first run from 79 s to 62 s. The rest is
+  speech that does not exist in the time available.
+
+### 11.6 Results on the test video (EN → pt-BR, 9.5 min, 6 speakers)
+
+| Run | Speed changed | Wrong rewrites | Speech faded out | Melody corr. |
+|---|---|---|---|---|
+| without `--lipsync` (Piper) | 181/189 lines, up to 2× | 0 | 7 lines | n/a |
+| LLM rewrites + 4B judge | none | — (judge accepted 47% of falsified) | 79 s | 0.85 |
+| LLM rewrites + NLI + LaBSE | none | ~1 in 4 sampled | 30.7 s | 0.84 |
+| LLM, own words only | none | ~1 in 5 sampled | 43.5 s | 0.84 |
+| **default: trim fillers** | **none** | **none by construction** | **64 s (89 lines)** | **0.83** |
+
+The full run takes 1.5 minutes once separation, ASR and the lip tracks are
+cached; the first run adds those stages (about 4, 2 and 7 minutes here, the
+lip tracking in parallel on the CPU).
+

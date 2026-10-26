@@ -141,6 +141,54 @@ stems, the transcript, the translations and the SRT files. Re-running reuses
 finished steps and redoes a step only when its inputs changed. Use `-f` to
 redo everything.
 
+## `--lipsync`: dubbing like a studio
+
+```sh
+./dubber -i talk.mp4 -l pt --lipsync
+```
+
+Human dubbers keep their natural pace and change the *words* until the line
+fits the speaker's time and, on camera, their lips. `--lipsync` works the
+same way. Nothing is sped up or slowed down.
+
+1. **Mouths** (`lips.py`). MediaPipe Face Landmarker tracks every face, frame
+   by frame, on the CPU while the GPU separates and transcribes. For each
+   face it records lip opening, closure and rounding, face size and turn.
+2. **Who speaks, and how** (`scene.py`).
+   * ECAPA speaker embeddings cluster the voices. Phrases are split where
+     the speaker changes.
+   * Each speaker's sex comes from a wav2vec2 age/gender model. Pitch alone
+     got it wrong here: a man at 177 Hz and a woman at 161 Hz.
+   * The speaking face is the one whose lips move at syllable rate with the
+     voice. Photos on screen and listeners who nod are rejected.
+   * Lip sync matters only where that face is big, frontal and on screen
+     (`lip_weight`).
+   * Pitch and loudness contours are kept for every phrase.
+3. **Adaptation** (`lipdub.py`). Kokoro speaks each translation, which gives
+   its real length and the timing of every phoneme. Lines that run too
+   long are shortened only by cutting what cannot carry a fact: fillers and
+   discourse markers ("então", "você sabe", "eu quero dizer",
+   "literalmente") and clause-opening subject pronouns, which pt-BR drops
+   naturally. Every version is spoken and scored on duration and, on
+   camera, on how well its visemes follow the measured lips.
+4. **Never a wrong translation.** Free LLM rewriting
+   (`DUBBER_ADAPT=llm`) is still there as an experiment, behind NLI and
+   LaBSE meaning checks. Reading its accepted rewrites showed about 1 in 4
+   subtly wrong, e.g. "the first senator since 1988" became "elected in
+   1988", so it is off by default (DESIGN.md §11.3).
+5. **Timeline.** A linear program places the clips as spoken:
+   * on camera, within ±0.15 s of the lips;
+   * off camera, sliding into the nearby pauses;
+   * cutting speech only where nothing else fits.
+6. **Voice and intonation.** Each speaker gets a Kokoro voice of their sex.
+   The original pitch contour, relative to the speaker's own mean, is laid
+   on the clip with PSOLA (Praat), which keeps the duration. The phrase's
+   loudness relative to the speaker is kept too.
+
+Languages with lip-sync voices: pt en es fr it hi. Others fall back to
+Piper. `lipsync_<lang>.json` in the work directory holds every line's
+candidates, rejected rewrites, scores, placement and intonation fit.
+
 ## Running next to a desktop
 
 `--best` needs about 10 GB of RAM, most of it the memory-mapped 12B model.
