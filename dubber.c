@@ -12,6 +12,13 @@
  *      not fit, so every phrase starts exactly where the original did
  *   6. remux the video: background + new voice (+ translated subtitles)
  *
+ * --lipsync replaces 4-5 with dubbing-studio rules: the mouths in the
+ * picture are tracked (lips.py), every phrase gets its speaker, sex, face
+ * and pitch contour (scene.py), and lipdub.py rewrites lines until their
+ * natural spoken length fits the original and, on camera, their visemes
+ * follow the lips; each speaker gets a voice of their sex (Kokoro) carrying
+ * the original intonation. Nothing is sped up or slowed down.
+ *
  * GPU (CUDA) is used for separation, ASR and translation when available;
  * TTS runs on the CPU in parallel, overlapping with the GPU translation of
  * the next language.
@@ -56,7 +63,7 @@ static struct {
 	const char *input, *audio, *output, *source, *model;
 	const char *voice, *workdir, *device, *prompt, *python, *translator;
 	double      bg;
-	int         jobs, subs, force, separate, best;
+	int         jobs, subs, force, separate, best, lipsync;
 } opt = {
 	.model = "turbo", .jobs = 0, .subs = 1, .device = "auto", .bg = -1,
 	.translator = "auto",
@@ -632,6 +639,95 @@ static const char *transcribe(const char *audio, char *srt, size_t n)
 	return lang;
 }
 
+/* --lipsync: track every face's mouth in the background (CPU), while the
+ * GPU separates and transcribes. Returns 0 when lips.npz is up to date. */
+static pid_t lips_start(void)
+{
+	char npz[PATH_MAX], key[PATH_MAX];
+	snprintf(npz, sizeof npz, "%s/lips.npz", opt.workdir);
+	snprintf(key, sizeof key, "%s/lips.key", opt.workdir);
+	if (!opt.force && file_ok(npz) && same_text(key, opt.input))
+		return 0;
+	unlink(key);
+	char log[PATH_MAX];
+	snprintf(log, sizeof log, "%s/lips.log", opt.workdir);
+	char *argv[] = { (char *)opt.python, (char *)helper("lips.py"),
+			 (char *)opt.input, npz, NULL };
+	return spawn(argv, NULL, log);
+}
+
+static void lips_finish(pid_t pid)
+{
+	char npz[PATH_MAX], key[PATH_MAX];
+	snprintf(npz, sizeof npz, "%s/lips.npz", opt.workdir);
+	snprintf(key, sizeof key, "%s/lips.key", opt.workdir);
+	step("lip tracking (MediaPipe Face Landmarker, CPU)");
+	if (!pid) {
+		fprintf(stderr, "    reusing %s\n", npz);
+		return;
+	}
+	if (!wait_ok(pid))
+		die("lip tracking failed (see %s/lips.log)", opt.workdir);
+	spit(key, opt.input);
+	char log[PATH_MAX], *t;
+	snprintf(log, sizeof log, "%s/lips.log", opt.workdir);
+	if ((t = slurp(log, NULL))) {     /* its last line is the summary */
+		char *e = t + strlen(t);
+		while (e > t && e[-1] == '\n')
+			*--e = 0;
+		char *l = strrchr(t, '\n');
+		fprintf(stderr, "    %s\n", l ? l + 1 : t);
+		free(t);
+	}
+}
+
+/* Speaker turns, sex, speaking face and intonation of every phrase;
+ * returns scene.srt, the phrases split at speaker turns. */
+static void scene(char *srt, size_t n)
+{
+	step("speakers, faces and intonation");
+	char *argv[] = { (char *)opt.python, (char *)helper("scene.py"),
+			 (char *)opt.workdir, NULL };
+	run(argv, NULL, NULL);
+	snprintf(srt, n, "%s/scene.srt", opt.workdir);
+}
+
+/* Languages lipdub.py has Kokoro voices for. */
+static int kokoro_lang(const char *lang)
+{
+	static const char *k[] = { "pt", "en", "es", "fr", "it", "hi" };
+	for (size_t i = 0; i < sizeof k / sizeof *k; i++)
+		if (!strcmp(k[i], lang))
+			return 1;
+	return 0;
+}
+
+/* Adapt the translation to time and lips, voice it with intonation;
+ * the chosen wording replaces s[].dst (for the subtitles). */
+static void lipdub(seg_t *s, int n, const char *src, const char *lang)
+{
+	step("lip-sync adaptation and voices %s (Kokoro, %s)", lang,
+	     opt.device);
+	char *argv[] = { (char *)opt.python, (char *)helper("lipdub.py"),
+			 (char *)opt.workdir, (char *)src, (char *)lang, NULL };
+	run(argv, NULL, NULL);
+	char path[PATH_MAX];
+	snprintf(path, sizeof path, "%s/%s_dub.txt", opt.workdir, lang);
+	char *buf = slurp(path, NULL), *line = buf;
+	if (!buf)
+		die("cannot read %s", path);
+	for (int i = 0; i < n; i++) {
+		char *nl = line ? strchr(line, '\n') : NULL;
+		if (!line || !nl)
+			die("%s has fewer lines than segments", path);
+		*nl = 0;
+		free(s[i].dst);
+		s[i].dst = xstrdup(trim(line));
+		line = nl + 1;
+	}
+	free(buf);
+}
+
 /* Start translating src.txt to LANG in the background (GPU), so the CPU
  * can keep synthesizing the previous language meanwhile. Returns 0 when
  * nothing has to run. */
@@ -805,6 +901,93 @@ static double slot_of(seg_t *s, int n, int i, double total)
 	return (i + 1 < n ? s[i + 1].start : total) - s[i].start;
 }
 
+/* Add CNT samples of PCM to TRACK at AT, with FADE-sample ramps at both
+ * ends and clipping protection. */
+static void mix_clip(int16_t *track, long len, const int16_t *pcm, long cnt,
+		     long at, int fade)
+{
+	if (at < 0) {
+		pcm -= at;
+		cnt += at;
+		at = 0;
+	}
+	if (at + cnt > len)
+		cnt = len - at;
+	for (long t = 0; t < cnt; t++) {
+		double g = 1.0;
+		if (t < fade)
+			g = (double)t / fade;
+		else if (t >= cnt - fade)
+			g = (double)(cnt - 1 - t) / fade;
+		int v = track[at + t] + (int)(pcm[t] * g);
+		track[at + t] = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+	}
+}
+
+/* --lipsync: lay out lipdub.py's clips at the times it chose
+ * (place_LANG.txt: "start clip" per line). Clips are used as spoken:
+ * no speed change; only a clip that would run into the next is faded out. */
+static void place(seg_t *s, int n, double total, const char *lang,
+		  const char *outwav)
+{
+	char path[PATH_MAX];
+	snprintf(path, sizeof path, "%s/place_%s.txt", opt.workdir, lang);
+	step("building dubbed voice track");
+	char *buf = slurp(path, NULL);
+	if (!buf)
+		die("cannot read %s", path);
+	int cap = n + 1, m = 0;
+	double *at = xmalloc(cap * sizeof *at);
+	char **wav = xmalloc(cap * sizeof *wav);
+	for (char *save, *l = strtok_r(buf, "\n", &save); l;
+	     l = strtok_r(NULL, "\n", &save)) {
+		char *sp = strchr(l, ' ');
+		if (!sp || m == cap)
+			continue;
+		*sp = 0;
+		at[m] = atof(l);
+		wav[m++] = sp + 1;
+	}
+	int rate = 0, cut = 0, early = 0;
+	long len = 0;
+	int16_t *track = NULL;
+	for (int k = 0; k < m; k++) {
+		int ns, r;
+		int16_t *pcm = read_wav(wav[k], &ns, &r);
+		if (!track) {
+			rate = r;
+			len = (long)(total * rate) + 1;
+			track = xmalloc(len * sizeof *track);   /* zeroed */
+		}
+		if (r != rate)
+			die("%s: sample rate mismatch", wav[k]);
+		long room = k + 1 < m ? (long)((at[k + 1] - at[k]) * rate) : ns;
+		long cnt = ns;
+		int fade = rate * FADE_MS / 1000;
+		if (cnt > room + fade) {
+			cnt = room;
+			cut++;
+		}
+		mix_clip(track, len, pcm, cnt, (long)(at[k] * rate), fade);
+		free(pcm);
+	}
+	for (int i = 0, k = 0; i < n && k < m; i++)   /* phrases started early */
+		if (*s[i].dst && speakable(s[i].dst))
+			early += at[k++] < s[i].start - 0.02;
+	if (!track)
+		die("no segment could be synthesized");
+	fprintf(stderr, "    %d clips at their natural speed; %d off-screen lines "
+		"start early", m, early);
+	if (cut)
+		fprintf(stderr, ", %d faded out before the next line", cut);
+	fputc('\n', stderr);
+	write_wav(outwav, track, len, rate);
+	free(track);
+	free(at);
+	free(wav);
+	free(buf);
+}
+
 static void synthesize(seg_t *s, int n, double total, const char *voice,
 		       const char *lang, const char *outwav)
 {
@@ -882,17 +1065,7 @@ static void synthesize(seg_t *s, int n, double total, const char *voice,
 			cnt = room;
 			cut++;
 		}
-		if (at + cnt > len)
-			cnt = len - at;
-		for (long t = 0; t < cnt; t++) {
-			double g = 1.0;
-			if (t < fade)
-				g = (double)t / fade;
-			else if (t >= cnt - fade)
-				g = (double)(cnt - 1 - t) / fade;
-			int v = track[at + t] + (int)(pcm[a + t] * g);
-			track[at + t] = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
-		}
+		mix_clip(track, len, pcm + a, cnt, at, fade);
 		free(pcm);
 	}
 	fprintf(stderr, "    all %d segments start on time: %d sped up by Piper, "
@@ -982,6 +1155,10 @@ static void usage(int code)
 "  -b, --bg VOLUME      background volume 0..2 (default 1.0 = as recorded;\n"
 "                       with --no-separate: original audio, default 0)\n"
 "      --no-separate    skip voice/background separation\n"
+"      --lipsync        dub like a studio: track the mouths in the picture,\n"
+"                       reword lines until they fit the time and the lips\n"
+"                       (never time-stretched), one voice per speaker of\n"
+"                       their sex, original intonation (pt en es fr it hi)\n"
 "  -j, --jobs N         parallel TTS processes (default: CPU cores / 2)\n"
 "  -w, --workdir DIR    intermediate files (default: <input>.work)\n"
 "      --no-subs        do not embed translated subtitles\n"
@@ -999,6 +1176,7 @@ int main(int argc, char **argv)
 		{ "translator", 1, 0, 't' }, { "best", 0, 0, 'B' },
 		{ "bg", 1, 0, 'b' }, { "jobs", 1, 0, 'j' }, { "workdir", 1, 0, 'w' },
 		{ "no-subs", 0, 0, 'S' }, { "no-separate", 0, 0, 'N' },
+		{ "lipsync", 0, 0, 'L' },
 		{ "force", 0, 0, 'f' }, { "help", 0, 0, 'h' }, { 0 }
 	};
 	char *langs[MAX_LANGS], *langarg = NULL;
@@ -1022,6 +1200,7 @@ int main(int argc, char **argv)
 		case 'w': opt.workdir = optarg; break;
 		case 'S': opt.subs = 0; break;
 		case 'N': opt.separate = 0; break;
+		case 'L': opt.lipsync = 1; break;
 		case 'f': opt.force = 1; break;
 		case 'h': usage(0); break;
 		default:  usage(1);
@@ -1085,15 +1264,23 @@ int main(int argc, char **argv)
 	setenv("PYTHONUNBUFFERED", "1", 1);   /* live helper progress in logs */
 	pick_python();
 
-	const char *tools[] = { "ffmpeg", "ffprobe", "piper", opt.python };
-	for (size_t i = 0; i < sizeof tools / sizeof *tools; i++)
+	int need_piper = !opt.lipsync;
+	for (int k = 0; k < nlangs; k++)
+		if (opt.lipsync && !kokoro_lang(langs[k])) {
+			fprintf(stderr, "dubber: no lip-sync voices for '%s'; it is "
+				"dubbed the usual way (Piper)\n", langs[k]);
+			need_piper = 1;
+		}
+	const char *tools[] = { "ffmpeg", "ffprobe", opt.python, "piper" };
+	for (size_t i = 0; i < sizeof tools / sizeof *tools - !need_piper; i++)
 		if (!in_path(tools[i]))
 			die("'%s' not found in PATH", tools[i]);
 
 	/* fail early, before the long GPU steps */
 	char voice[MAX_LANGS][PATH_MAX], output[MAX_LANGS][PATH_MAX];
 	for (int k = 0; k < nlangs; k++) {
-		find_voice(langs[k], voice[k], sizeof voice[k]);
+		if (!opt.lipsync || !kokoro_lang(langs[k]))
+			find_voice(langs[k], voice[k], sizeof voice[k]);
 		if (opt.output && nlangs == 1) {
 			snprintf(output[k], PATH_MAX, "%s", opt.output);
 		} else if (opt.output) {
@@ -1129,9 +1316,16 @@ int main(int argc, char **argv)
 	snprintf(background, sizeof background, "%s/background.wav", opt.workdir);
 
 	extract_audio(speech, source);
+	pid_t lpid = opt.lipsync ? lips_start() : 0;   /* CPU, beside the GPU */
 	if (opt.separate)
 		separate(source);
 	const char *src = transcribe(opt.separate ? vocals : source, srt, sizeof srt);
+	if (opt.lipsync) {
+		if (!opt.separate)
+			die("--lipsync needs the separated voice (drop --no-separate)");
+		lips_finish(lpid);
+		scene(srt, sizeof srt);
+	}
 
 	int n;
 	seg_t *segs = parse_srt(srt, &n);
@@ -1183,11 +1377,21 @@ int main(int argc, char **argv)
 		snprintf(dubsrt, sizeof dubsrt, "%s/%s.srt", opt.workdir, lang);
 		snprintf(dubwav, sizeof dubwav, "%s/dub_%s.wav", opt.workdir, lang);
 
+		int lips = opt.lipsync && kokoro_lang(lang);
 		translate_finish(tpid, segs, n, src, lang);
-		tpid = k + 1 < nlangs ? translate_start(src, langs[k + 1]) : 0;
+		/* lipdub.py needs the GPU itself: no translation beside it */
+		tpid = k + 1 < nlangs && !lips ? translate_start(src, langs[k + 1]) : 0;
 
-		write_srt(dubsrt, segs, n);
-		synthesize(segs, n, total, voice[k], lang, dubwav);
+		if (lips) {
+			lipdub(segs, n, src, lang);
+			write_srt(dubsrt, segs, n);
+			place(segs, n, total, lang, dubwav);
+			if (k + 1 < nlangs)
+				tpid = translate_start(src, langs[k + 1]);
+		} else {
+			write_srt(dubsrt, segs, n);
+			synthesize(segs, n, total, voice[k], lang, dubwav);
+		}
 		const char *bgsrc = !(opt.bg > 0) ? NULL
 				  : opt.separate ? background : speech;
 		mux(output[k], dubwav, dubsrt, bgsrc, opt.bg);

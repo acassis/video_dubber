@@ -115,4 +115,25 @@ for l in $LANGS; do
     [ -s "$VOICEDIR/$f.onnx" ] || curl -fL -o "$VOICEDIR/$f.onnx" "$HF/$v.onnx"
     [ -s "$VOICEDIR/$f.onnx.json" ] || curl -fL -o "$VOICEDIR/$f.onnx.json" "$HF/$v.onnx.json"
 done
+# --lipsync: mouth tracking, speakers, sex, meaning check, Kokoro voices
+echo "== lip-sync models (MediaPipe, ECAPA, age/gender, LaBSE, Kokoro)"
+"$VENV/bin/pip" install -q --resume-retries 20 mediapipe praat-parselmouth \
+    speechbrain kokoro
+mkdir -p "$DATA/vision"
+F=$DATA/vision/face_landmarker.task
+[ -s "$F" ] || curl -fL -o "$F" https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task
+"$PY" -c "
+from huggingface_hub import snapshot_download as get
+get('speechbrain/spkrec-ecapa-voxceleb')
+get('audeering/wav2vec2-large-robust-6-ft-age-gender')   # CC BY-NC-SA 4.0
+get('MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7',
+    allow_patterns=['*.json', '*.model', 'model.safetensors'])
+get('sentence-transformers/LaBSE', allow_patterns=['*.json', '*.txt',
+    'model.safetensors', '1_Pooling/*', '2_Dense/*'])
+v = ['pf_dora', 'pm_alex', 'pm_santa', 'af_heart', 'af_bella', 'am_michael',
+     'am_fenrir', 'ef_dora', 'em_alex', 'em_santa', 'ff_siwis', 'if_sara',
+     'im_nicola', 'hf_alpha', 'hf_beta', 'hm_omega', 'hm_psi']
+get('hexgrad/Kokoro-82M', allow_patterns=['config.json', 'kokoro-v1_0.pth']
+    + [f'voices/{x}.pt' for x in v])
+"
 echo "== done; models are cached locally"
