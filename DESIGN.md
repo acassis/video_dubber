@@ -560,7 +560,8 @@ Model data (`~/.local/share/dubber/`): `venv/`, `voices/`, `separator/`,
 | `DUBBER_NLLB_MODEL` | translate.py | NLLB model name or directory |
 | `DUBBER_SEP_MODEL`, `DUBBER_SEP_MODELS` | separate.py | separation model file and directory |
 | `DUBBER_LORA_EPOCHS`, `DUBBER_LORA_RANK`, `DUBBER_LORA_SKIP_TRAIN` | train_lora.py | training settings |
-| `DUBBER_ADAPT` | lipdub.py | `trim` (default: cut fillers only) or `llm` (experimental LLM rewrites, §11.3) |
+| `DUBBER_ADAPT` | lipdub.py | `trim` (default: cut fillers only), `iso`, `block` (§11.7) or `llm` (§11.3) |
+| `DUBBER_LIPS_JOBS` | lips.py | parallel processes (default: cores / 2, at most 8) |
 | `DUBBER_FACE_MODEL` | lips.py | MediaPipe face landmarker `.task` file |
 | `DUBBER_LLM_SIZE` | fetch_models.sh | `4b` (default) or `12b` |
 | `DUBBER_VENV`, `DUBBER_VOICES` | fetch_models.sh | install locations |
@@ -735,3 +736,99 @@ The full run takes 1.5 minutes once separation, ASR and the lip tracks are
 cached; the first run adds those stages (about 4, 2 and 7 minutes here, the
 lip tracking in parallel on the CPU).
 
+### 11.7 Faster lips, and three adaptation strategies compared
+
+**Lips.**
+* `lips.py` now cuts the video into time chunks analysed by parallel
+  processes (8 on a 16-core CPU), joining tracks at the seams.
+* Each face found on a half-size frame is measured again on a 256-px crop
+  of the full-resolution frame.
+* It runs in 164 s instead of 435 s for 9.5 minutes of 1080p video.
+
+How well the speaking face's mouth follows its own voice on the 26–27
+on-camera lines (correlation, 0–4 frames of lip lead):
+
+| Mouth signal | Audio envelope | Old tracker | New tracker |
+|---|---|---|---|
+| inner-lip gap | loudness | +0.07 | — |
+| inner-lip gap | 300–3000 Hz | +0.14 | +0.18 |
+| jawOpen | 300–3000 Hz | +0.19 | +0.20 (+0.21 with jaw face choice) |
+
+The full-resolution crops barely matter; the signal does. `scene.py` now
+reads lips as `jawOpen` against the speech-band envelope.
+
+**Three strategies (`DUBBER_ADAPT`), judged by an independent evaluator
+agent.** The agent read the English and Portuguese at 40 random times and
+every changed unit, transcribed each dub back with Whisper, and computed
+the sync figures.
+
+| | A `trim` | B `iso` | C `block` |
+|---|---|---|---|
+| unit | phrase | phrase | one speaker's utterance |
+| errors from its own rewrites | 0 / 34 | 3 (+2 borderline) / 53 | 2 / 17 |
+| speech faded out | 63.8 s | 50.0 s | 43.0 s |
+| word error rate of the heard dub | 0.128 | 0.115 | 0.109 |
+| on camera: phrase heard vs said, median / max | 0.16 / 0.35 s | 0.18 / 0.39 s | 0.52 / 3.38 s |
+| all phrases: median / 90th percentile | 0.21 / 0.84 s | 0.22 / 0.85 s | 0.51 / 1.53 s |
+
+* **B (isometric MT):** asking Gemma to translate from the English within a
+  syllable budget still changes facts (an agent becomes a different person,
+  "who is ahead" becomes "who wins").
+* **C:** joining utterances shortens the text but anchors only the first
+  phrase; inner phrases drift by more than 1 s.
+* **Ranking:** A, then B and C mixed. `trim` stays the default.
+
+**What limits every version** is not adaptation:
+* About a third of the sampled lines carry an error of the literal
+  translation or of the English transcript, shared by all three:
+  misaligned or duplicated phrase translations, a mistranslated fraction,
+  garbled names.
+* 8–11 facts per version are lost to the fade-out.
+
+Next steps, from the evaluation:
+1. Choose candidates so the faded tail never holds a number, name,
+   negation or the main verb.
+2. Translate each phrase with its full sentence as context, then split the
+   result back to the phrases.
+3. Add a names glossary for ASR and the translator.
+4. After mixing, transcribe the dub and check that every number and name is
+   heard.
+
+
+### 11.8 No more voices cut mid-word
+
+Listening to versions A–C, the owner heard voices "cut in the middle"
+with new words starting abruptly.
+* **Cause:** in A, 90 of 194 lines were faded out in 8 ms where the next
+  line started, by a median of 0.53 s, often mid-word.
+* **69 of the 90** were followed by the same speaker. Whisper had split
+  one person's continuous speech, so the voice stopped mid-word and then
+  restarted 60 ms later.
+
+Version D (`video_pt_D.mp4`, now the behaviour of every mode):
+* **Turns.** A speaker's phrases less than 0.8 s apart form a turn.
+  * Only the first line of a turn is held to the lips.
+  * Later lines follow the speech already under way, up to 0.6 s late on
+    camera and 2 s off camera.
+  * A cut inside a turn costs 10× more than one at its end.
+* **Pauses.** A speaker keeps their own pause between lines (0.06–0.25 s).
+  A change of speaker gets 0.12 s.
+* **Endings.** A line that still does not fit is spoken again, shorter.
+  * It ends on a word, preferably a clause boundary, with a full stop, so
+    the voice falls and finishes.
+  * Every accepted wording's endings are compared. Losing a number, name
+    or negation costs 0.6 of the line.
+
+| | A | D |
+|---|---|---|
+| lines ending mid-word | 86 | **16** |
+| syllables not heard | 13.2% | 14.4% |
+| numbers, names, negations lost | 43 | 54 |
+
+Natural endings drop whole words where A chopped half of one, so slightly
+more content is lost. The first D attempt used fixed 0.18 / 0.12 s pauses
+and lost 15.7% (63 facts). Following the speaker's own pauses brought that
+down to 14.4%.
+
+Comparison excerpts are in `lipsync/samples/`: the original, the old
+tracker, A and D, for three passages.
