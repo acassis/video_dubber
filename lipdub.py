@@ -9,6 +9,7 @@ and WORKDIR/LANG.txt (first translation, translate.py). Writes
 
   tts_LANG/NNNNN.wav    the final clip of each phrase (24 kHz, trimmed)
   LANG_dub.txt          the wording chosen for each phrase
+  LANG_dub.srt          subtitles at the times the lines are spoken
   place_LANG.txt        "<start seconds> <clip>" per phrase, for dubber.c
   lipsync_LANG.json     candidates, durations and scores of every phrase
 
@@ -65,7 +66,14 @@ KOKORO = {
     "it": ("i", {"f": ["if_sara"], "m": ["im_nicola"]}),
     "hi": ("h", {"f": ["hf_alpha", "hf_beta"], "m": ["hm_omega", "hm_psi"]}),
 }
-GAP = 0.06          # silence kept before the next phrase
+GAP = 0.12          # pause before another speaker's line (turn-taking)
+GAP_SAME = 0.06     # one speaker's lines keep their own pause, at least this
+GAP_MAX = 0.25      # ... and at most this
+TURN_GAP = 0.8      # one speaker's phrases closer than this form a turn
+INNER_ON = 0.6      # inside a turn, on camera, a line may come this late
+INNER_OFF = 2.0     # ... and off camera this late
+CUT_INSIDE = 200.0  # cutting a line its own speaker continues: almost never
+LOST_W = 0.6        # shortened ending: cost of losing a number/name/negation
 EARLY = 0.35        # off-screen lines may start this much earlier
 SHIFT = 0.10        # on-screen lines may move this much to meet the lips
 SHIFT_ON = 0.15     # timeline: on-camera lines stay this close to the lips
@@ -74,6 +82,9 @@ LATE_OFF = 1.5      # ... or this much later, into the following pause
 CUT_COST = 20.0     # a second of speech cut costs as much as moving 20 s
 TOL = 0.08          # duration error (fraction) that costs nothing
 MIN_ERR = 0.25      # s; a line closer than this to its time is left alone
+BLOCK_GAP = 0.8     # block mode: one speaker's phrases closer than this join
+BLOCK_MAX = 15.0    # ... into utterances of at most this many seconds
+ISO_N = 4           # isochronous translations asked per line
 LIP_W = 1.2         # weight of lip agreement against duration fit
 NEED_LIPS = 0.25    # lip weight from which lip-aware variants are asked for
 VARIANTS = 6          # about half survive the meaning check
@@ -145,8 +156,10 @@ class Speaker:
             if r.pred_dur is not None and r.phonemes:
                 d = r.pred_dur.cpu().numpy() * UNIT / RATE
                 edges = t + np.concatenate([[0], np.cumsum(d)])
-                # pred_dur: BOS, one per phoneme symbol, EOS
-                for k, ch in enumerate(r.phonemes):
+                # pred_dur: BOS, one per phoneme symbol Kokoro knows, EOS
+                # (symbols missing from its vocabulary are dropped first)
+                known = [c for c in r.phonemes if c in self.model.vocab]
+                for k, ch in enumerate(known[:len(edges) - 2]):
                     phon.append((ch, edges[k + 1], edges[k + 2]))
             audio.append(a)
             t += len(a) / RATE
@@ -445,6 +458,85 @@ def ask_variants(get_llm, ph, phrases, done, src, tgt, cache, feedback=None):
     return cache[prompt]
 
 
+def merge(P, idx, pad, hop, fps):
+    """One scene entry for the consecutive phrases P[idx] of one speaker:
+    their pitch, loudness and mouth curves on one grid."""
+    ps = [P[i] for i in idx]
+    a, b = ps[0]["start"], ps[-1]["end"]
+    g0 = max(0.0, a - pad)
+    n = int(round((b - g0) / hop))
+    f0, db = [None] * n, [-60.0] * n
+    for p in ps:
+        k0 = int(round((max(0.0, p["start"] - pad) - g0) / hop))
+        for k, (f, d) in enumerate(zip(p["f0"], p["db"])):
+            if 0 <= k0 + k < n:
+                f0[k0 + k], db[k0 + k] = f, d
+    m0 = int((a - pad) * fps) if any(p["mouth"] for p in ps) else 0
+    m0 = max(m0, 0)
+    mouth = None
+    seen = [p for p in ps if p["mouth"]]
+    if seen:
+        mouth = [None] * (int(b * fps) + 2 - m0)
+        for p in seen:
+            for k, v in enumerate(p["mouth"]):
+                if 0 <= p["mouth_frame0"] + k - m0 < len(mouth) and v is not None:
+                    mouth[p["mouth_frame0"] + k - m0] = v
+    dur = sum(p["end"] - p["start"] for p in ps)
+    lw = sum(p["lip_weight"] * (p["end"] - p["start"]) for p in ps) / dur
+    return dict(start=a, end=b, speaker=ps[0]["speaker"],
+                gender=ps[0]["gender"], f0=f0, db=db, mouth=mouth,
+                mouth_frame0=m0, lip_weight=lw if seen else 0.0)
+
+
+def units_of(P, mode):
+    """Index groups: one phrase each, or (block mode) one speaker's
+    utterance, so that Whisper's arbitrary phrase cuts do not split a
+    sentence and its inner pauses can be shared."""
+    if mode != "block":
+        return [[i] for i in range(len(P))]
+    out = []
+    for i, p in enumerate(P):
+        if out:
+            q = P[out[-1][-1]]
+            if p["speaker"] == q["speaker"] and \
+                    p["start"] - q["end"] < BLOCK_GAP and \
+                    p["end"] - P[out[-1][0]]["start"] <= BLOCK_MAX:
+                out[-1].append(i)
+                continue
+        out.append([i])
+    return out
+
+
+def ask_iso(get_llm, ph, units, src, tgt, cache, rate):
+    """Isometric translation (Lakew et al. 2022): ISO_N translations of the
+    source written to be spoken in the speaker's own time."""
+    s, t = T.NAMES.get(src, src), T.NAMES.get(tgt, tgt)
+    want = max(2, round(ph.target * rate * 0.95))
+    prev = units[ph.k - 1].src if ph.k > 0 else ""
+    nxt = units[ph.k + 1].src if ph.k + 1 < len(units) else ""
+    hint = os.environ.get("DUBBER_PROMPT", "").strip()
+    prompt = "\n".join(l for l in [
+        f"You translate a {s} TV programme"
+        + (f" ({hint})" if hint else "") + f" into {t} for dubbing.",
+        f"Before (context only): {prev}" if prev else "",
+        f"Line to translate: {ph.src}",
+        f"After (context only): {nxt}" if nxt else "",
+        f"A reference translation: {ph.base}",
+        f"The speaker says this line in {ph.target:.1f} s, so the {t} must be "
+        f"speakable in that time: about {want} syllables "
+        f"(the reference has {syllables(ph.base)}).",
+        "Keep every fact, claim, name and number. You may drop fillers "
+        "(\"you know\", \"I mean\"), repetitions and hesitations, and use "
+        f"concise, natural spoken {t}.",
+        f"Write {ISO_N} different versions, numbered 1. to {ISO_N}, nothing "
+        "else."] if l)
+    if prompt not in cache:
+        ok = lambda x: T.plausible(x, src, tgt) and keeps_facts(x, ph.base)
+        out = get_llm().numbered(prompt, ISO_N, 140 * ISO_N, ok)
+        cache[prompt] = [T.strip_foreign(T.clean(x), tgt) for x in out if x]
+    return cache[prompt]
+
+
 class Meaning:
     """LaBSE (Feng et al. 2022): cross-lingual sentence embeddings made for
     scoring translation pairs. Runs on the CPU, next to the LLM."""
@@ -547,11 +639,17 @@ def choose(phrases, audio, prev_end_of):
 
 def schedule(phrases, total):
     """Place every chosen clip, as spoken, on the timeline: a linear program
-    (HiGHS). Clips never overlap; on camera a line stays within SHIFT of the
-    lips, off camera it may slide into the surrounding pauses, as dubbers
-    let an off-screen voice run on. Cutting speech short costs far more than
-    moving it, so it only happens where nothing else fits. Sets ph.at and
-    ph.cut (seconds faded out at the end)."""
+    (HiGHS). Clips never overlap, and a natural pause separates them.
+
+    Whisper often splits one person's continuous speech into several
+    phrases; cutting such a phrase short and starting the same voice again
+    sounds like a broken recording. So phrases of one speaker closer than
+    TURN_GAP form a turn: only the turn's first line is held to the lips
+    (on camera within SHIFT_ON); later lines follow the speech already
+    under way and may come later (INNER_ON / INNER_OFF), since the speaker's
+    mouth is moving all through the turn anyway. Cutting is cheapest at the
+    end of a turn and nearly forbidden inside one. Off camera, lines may also
+    slide into pauses. Sets ph.at and ph.cut (seconds that do not fit)."""
     from scipy.optimize import linprog
     from scipy.sparse import lil_matrix
     ps = [ph for ph in phrases if ph.best]
@@ -562,22 +660,32 @@ def schedule(phrases, total):
     X, U, V, O = 0, n, 2 * n, 3 * n
     c = np.zeros(4 * n)
     bounds = []
+    cont = [k + 1 < n and ps[k + 1].speaker == ph.speaker and
+            ps[k + 1].start - ph.end < TURN_GAP for k, ph in enumerate(ps)]
     for k, ph in enumerate(ps):
         lw = ph.lip_weight
-        lo, hi = (-SHIFT_ON, SHIFT_ON) if lw >= NEED_LIPS else \
-            (-0.4, 0.6) if lw > 0 else (-EARLY_OFF, LATE_OFF)
+        inner = k > 0 and cont[k - 1]
+        if lw >= NEED_LIPS:
+            lo, hi = -SHIFT_ON, INNER_ON if inner else SHIFT_ON
+        elif lw > 0:
+            lo, hi = -0.4, 1.0 if inner else 0.6
+        else:
+            lo, hi = -EARLY_OFF, INNER_OFF if inner else LATE_OFF
         s = ph.best["start"]
         bounds.append((max(0.0, s + lo), max(0.0, s + hi)))
-        c[U + k] = c[V + k] = 1 + 5 * lw
-        c[O + k] = CUT_COST
+        # inside a turn the timing is the voice's own: weigh it lightly
+        c[U + k] = c[V + k] = (0.3 if inner else 1) * (1 + 5 * lw)
+        c[O + k] = CUT_INSIDE if cont[k] else CUT_COST
     bounds += [(0, None)] * (2 * n)
     bounds += [(0, ph.best["dur"]) for ph in ps]
     A = lil_matrix((n - 1 + 2 * n + 1, 4 * n))
     b = np.zeros(A.shape[0])
     r = 0
-    for k in range(n - 1):      # x_k + d_k - o_k + GAP <= x_k+1
+    for k in range(n - 1):      # x_k + d_k - o_k + pause <= x_k+1
         A[r, X + k], A[r, O + k], A[r, X + k + 1] = 1, -1, -1
-        b[r] = -ps[k].best["dur"] - GAP
+        pause = min(max(GAP_SAME, ps[k + 1].start - ps[k].end), GAP_MAX) \
+            if cont[k] else GAP
+        b[r] = -ps[k].best["dur"] - pause
         r += 1
     for k, ph in enumerate(ps):  # x - s = u - v, as two inequalities
         s = ph.best["start"]
@@ -600,9 +708,74 @@ def schedule(phrases, total):
         ph.cut = float(res.x[O + k]) if res.x[O + k] > 0.005 else 0.0
     moved = [ph.at - ph.start for ph in ps]
     cut = [ph.cut for ph in ps if ph.cut]
-    log(f"timeline: lines moved by {np.median(np.abs(moved)):.2f} s median "
-        f"(max {max(moved):+.2f} / {min(moved):+.2f} s); {len(cut)} lines "
-        f"must still be cut, {sum(cut):.1f} s of speech in all")
+    inside = sum(1 for k, ph in enumerate(ps) if ph.cut and cont[k])
+    log(f"timeline: {sum(cont)} lines continue their speaker's turn; lines "
+        f"moved by {np.median(np.abs(moved)):.2f} s median (max "
+        f"{max(moved):+.2f} / {min(moved):+.2f} s); {len(cut)} lines too "
+        f"long, {sum(cut):.1f} s in all ({inside} inside a turn)")
+
+
+NEGATION = re.compile(r"\b(não|nunca|nem|nenhum|nenhuma|nada|jamais)\b",
+                      re.IGNORECASE)
+
+
+def facts(text):
+    """Numbers, names and negations: what a shortened line must not lose."""
+    return set(re.findall(r"\d+", text)) | \
+        set(re.findall(r"(?<=\s)[A-Z][\w-]+", " " + text)) | \
+        set(w.lower() for w in NEGATION.findall(text))
+
+
+def fit_endings(spk, phrases, voice_of, audio):
+    """A line the timeline cannot fit is not chopped mid-word: it is spoken
+    again, shorter, ending at a word boundary (at a clause boundary when
+    possible) with a full stop, so the voice falls and finishes as a
+    speaker does. Among the shortened versions of every accepted wording,
+    the one keeping the most, and losing no number, name or negation where
+    possible, wins."""
+    fixed = 0
+    for ph in phrases:
+        if not ph.best or ph.cut <= 0.02:
+            continue
+        room = ph.best["dur"] - ph.cut
+        keep = facts(ph.base)
+        tries = []
+        for text in ph.cands:
+            words = text.split()
+            dur = ph.best["dur"] if text == ph.best["text"] else \
+                len(audio[(ph.i, text)][0]) / RATE
+            syl = syllables(text)
+            for j in range(len(words) - 1, 0, -1):
+                pre = " ".join(words[:j]).rstrip(",;:—-–… ")
+                est = dur * syllables(pre) / syl
+                if est <= room * 1.15 and re.search(r"\w", pre):
+                    clause = words[j - 1][-1] in ",;:.!?"
+                    tries.append((pre.rstrip(".!?") + ".", clause))
+        best = None
+        tries = sorted(set(tries), key=lambda t: -syllables(t[0]))[:8]
+        for pre, clause in tries:
+            a, phon = spk.say(pre, voice_of[ph.speaker])
+            d = len(a) / RATE
+            if not len(a) or d > room + 0.03:
+                continue
+            lost = len(keep - facts(pre))
+            score = syllables(pre) / syllables(ph.base) - LOST_W * lost + \
+                (0.1 if clause else 0)
+            if best is None or score > best[0]:
+                best = (score, pre, a, phon, d)
+        if best is None:
+            # not even a few words fit: leave the line to the fade-out
+            continue
+        _, pre, a, phon, d = best
+        audio[(ph.i, pre)] = (a, phon)
+        ph.shortened = dict(full=ph.best["text"], kept=pre)
+        ph.best = dict(ph.best, text=pre, dur=round(d, 3),
+                       syl=syllables(pre), over=0.0)
+        ph.cut = 0.0
+        fixed += 1
+    left = sum(1 for ph in phrases if ph.best and ph.cut > 0.02)
+    log(f"{fixed} lines that did not fit end on a word, spoken again "
+        f"shorter; {left} still fade out")
 
 
 # ------------------------------------------------------------ intonation
@@ -676,6 +849,12 @@ def loudness(ph, pad, hop):
 
 # ------------------------------------------------------------------ main
 
+def srt_time(t):
+    ms = int(round(max(t, 0) * 1000))
+    return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d}," \
+           f"{ms % 1000:03d}"
+
+
 def write_wav(path, x):
     import soundfile as sf
     sf.write(path, np.clip(x, -1, 1), RATE, subtype="PCM_16")
@@ -700,9 +879,20 @@ def main():
     import soundfile as sf
     total = sf.info(os.path.join(wd, "vocals.wav")).duration
     fps, hop, pad = scene["fps"] or 25.0, scene["hop"], scene["pad"]
-    phrases = [Phrase(i, p, srcl[i], base[i],
-                      P[i + 1]["start"] if i + 1 < len(P) else total, fps)
-               for i, p in enumerate(P)]
+    adapt = os.environ.get("DUBBER_ADAPT", "trim")
+    groups = units_of(P, adapt)
+    phrases = []    # translation units: phrases, or utterances (block mode)
+    for k, idx in enumerate(groups):
+        nxt = P[groups[k + 1][0]]["start"] if k + 1 < len(groups) else total
+        p = P[idx[0]] if len(idx) == 1 else merge(P, idx, scene["pad"],
+                                                  scene["hop"], scene["fps"])
+        ph = Phrase(k, p, " ".join(srcl[i] for i in idx).strip(),
+                    " ".join(base[i] for i in idx if base[i].strip()).strip(),
+                    nxt, fps)
+        ph.k, ph.members = k, idx
+        phrases.append(ph)
+    if adapt == "block":
+        log(f"{len(P)} phrases joined into {len(phrases)} utterances")
 
     # one voice per speaker, by sex, most talkative first
     talk = {}
@@ -769,7 +959,6 @@ def main():
     # pronouns). LLM rewriting is opt-in: checked on this pipeline's own
     # output, about 1 in 5 of its accepted rewrites was still wrong
     # (e.g. deleting "first ... since" from "first senator since 1988").
-    adapt = os.environ.get("DUBBER_ADAPT", "trim")
     todo = [ph for ph in live if needy(ph, False)]
     offers = [(ph, k + 1, v) for ph in todo
               for k, v in enumerate(trims(ph.base, tgt))]
@@ -792,6 +981,65 @@ def main():
         log(f"trimming fillers: {len(new)} shorter versions of "
             f"{len({ph.i for ph, _ in new})} lines "
             f"({len(offers) - len(new)} rejected by the NLI guard)")
+        audio.update(synth_all(spk, new, voice_of))
+        choose(live, audio, ends)
+
+    if use_llm and adapt in ("iso", "block"):
+        # the voice's own pace, measured on what it has spoken so far
+        rate = {}
+        for v in set(voice_of.values()):
+            mine = [ph.best for ph in live
+                    if ph.best and voice_of[ph.speaker] == v]
+            rate[v] = sum(b["syl"] for b in mine) / \
+                max(sum(b["dur"] for b in mine), 1e-3) if mine else 5.0
+        todo = [ph for ph in live if needy(ph, False)]
+        log(f"isochronous translation of {len(todo)} "
+            f"{'utterances' if adapt == 'block' else 'lines'}")
+        spk.free()
+        box = []
+
+        def get_llm():
+            if not box:
+                box.append(T.LLM(path))
+            return box[0]
+        offers, t1 = [], time.time()
+        for k, ph in enumerate(todo):
+            vs = ask_iso(get_llm, ph, phrases, src, tgt, cache,
+                         rate[voice_of[ph.speaker]])
+            offers += [(ph, j + 1, v) for j, v in enumerate(vs)
+                       if v and v not in ph.cands]
+            if (k + 1) % 20 == 0:
+                log(f"asked {k + 1}/{len(todo)} ({time.time() - t1:.0f} s)")
+        if box:
+            box[0].m.close()
+            box.clear()
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        new = []
+        if offers:
+            nli = Entail(dev)
+            bases = [ph.base for ph, _, _ in offers]
+            vs = [v for _, _, v in offers]
+            fwd, back = nli.probs(bases, vs), nli.probs(vs, bases)
+            nli.free()
+            for (ph, j, v), f, b in zip(offers, fwd, back):
+                sim = float(meaning.sim(ph.src, [v])[0])
+                same = min(f[0], b[0]) >= SAME
+                condensed = f[0] >= SAME and max(f[2], b[2]) < CONTRA and \
+                    sim >= ph.base_sim - COND_DROP
+                if same or condensed:
+                    ph.cands[v] = j
+                    ph.sim[v] = sim
+                    ph.full[v] = 1.0 if same else float(b[0])
+                    new.append((ph, v))
+                else:
+                    ph.wrong[v] = dict(entails=round(float(f[0]), 3),
+                                       entailed=round(float(b[0]), 3),
+                                       contra=round(float(max(f[2], b[2])), 3),
+                                       sim=round(sim, 3))
+        log(f"{len(offers)} isochronous translations, {len(offers) - len(new)} "
+            f"rejected by the meaning checks")
+        spk = Speaker(tgt, dev)
         audio.update(synth_all(spk, new, voice_of))
         choose(live, audio, ends)
 
@@ -866,6 +1114,9 @@ def main():
         choose(live, audio, ends)
 
     schedule(phrases, total)
+    if not hasattr(spk, "pipe"):
+        spk = Speaker(tgt, dev)
+    fit_endings(spk, phrases, voice_of, audio)
 
     # intonation: the speaker's melody on the voice, PSOLA keeps duration
     spk_mean = {}
@@ -904,7 +1155,8 @@ def main():
         wav = os.path.join(out_dir, f"{ph.i:05d}.wav")
         write_wav(wav, a)
         place.append(f"{ph.at:.3f} {wav}")
-        report.append(dict(i=ph.i, start=ph.start, end=ph.end,
+        report.append(dict(i=ph.i, phrases=ph.members, start=ph.start,
+                           end=ph.end,
                            speaker=ph.speaker, voice=voice_of[ph.speaker],
                            lip_weight=ph.lip_weight, src=ph.src,
                            base=base_rec.get(ph.i), chosen=b,
@@ -914,11 +1166,27 @@ def main():
                            base_meaning=round(ph.base_sim, 3),
                            candidates=getattr(ph, "recs", []),
                            rejected=ph.wrong,
+                           shortened=getattr(ph, "shortened", None),
                            intonation=fit))
 
+    lines = [""] * len(P)
+    for ph in phrases:
+        if ph.best:
+            lines[ph.members[0]] = ph.best["text"]
     with open(os.path.join(wd, f"{tgt}_dub.txt"), "w", encoding="utf-8") as f:
+        f.write("".join(l + "\n" for l in lines))
+    with open(os.path.join(wd, f"{tgt}_dub.srt"), "w", encoding="utf-8") as f:
+        n = 0
         for ph in phrases:
-            f.write((ph.best["text"] if ph.best else "") + "\n")
+            if ph.best:
+                n += 1
+                end = ph.at + ph.best["dur"] - ph.cut
+                f.write(f"{n}\n{srt_time(ph.at)} --> {srt_time(end)}\n"
+                        f"{ph.best['text']}\n\n")
+    early = sum(ph.best and ph.at < ph.start - 0.02 for ph in phrases)
+    late = sum(ph.best and ph.at > ph.start + 0.02 for ph in phrases)
+    log(f"{early} lines start early, {late} late (off camera, into pauses); "
+        f"{sum(bool(ph.best and ph.cut) for ph in phrases)} cut short")
     with open(os.path.join(wd, f"place_{tgt}.txt"), "w") as f:
         f.write("\n".join(place) + "\n")
     with open(os.path.join(wd, f"lipsync_{tgt}.json"), "w") as f:

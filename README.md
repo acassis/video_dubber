@@ -185,6 +185,12 @@ same way. Nothing is sped up or slowed down.
    on the clip with PSOLA (Praat), which keeps the duration. The phrase's
    loudness relative to the speaker is kept too.
 
+`DUBBER_ADAPT` picks the strategy: `trim` (default; only fillers and
+pronouns go), `iso` (isochronous re-translation from the source) or
+`block` (one speaker's utterance as one unit). An evaluation of all three
+on a TV panel is in DESIGN.md section 11.7: `trim` was the only one that
+introduced no translation error.
+
 Languages with lip-sync voices: pt en es fr it hi. Others fall back to
 Piper. `lipsync_<lang>.json` in the work directory holds every line's
 candidates, rejected rewrites, scores, placement and intonation fit.

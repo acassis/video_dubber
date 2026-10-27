@@ -948,7 +948,7 @@ static void place(seg_t *s, int n, double total, const char *lang,
 		at[m] = atof(l);
 		wav[m++] = sp + 1;
 	}
-	int rate = 0, cut = 0, early = 0;
+	int rate = 0, cut = 0;
 	long len = 0;
 	int16_t *track = NULL;
 	for (int k = 0; k < m; k++) {
@@ -971,13 +971,11 @@ static void place(seg_t *s, int n, double total, const char *lang,
 		mix_clip(track, len, pcm, cnt, (long)(at[k] * rate), fade);
 		free(pcm);
 	}
-	for (int i = 0, k = 0; i < n && k < m; i++)   /* phrases started early */
-		if (*s[i].dst && speakable(s[i].dst))
-			early += at[k++] < s[i].start - 0.02;
+	(void)s;
+	(void)n;
 	if (!track)
 		die("no segment could be synthesized");
-	fprintf(stderr, "    %d clips at their natural speed; %d off-screen lines "
-		"start early", m, early);
+	fprintf(stderr, "    %d clips at their natural speed", m);
 	if (cut)
 		fprintf(stderr, ", %d faded out before the next line", cut);
 	fputc('\n', stderr);
@@ -1384,7 +1382,8 @@ int main(int argc, char **argv)
 
 		if (lips) {
 			lipdub(segs, n, src, lang);
-			write_srt(dubsrt, segs, n);
+			/* lipdub.py's subtitles follow the lines as placed */
+			snprintf(dubsrt, sizeof dubsrt, "%s/%s_dub.srt", opt.workdir, lang);
 			place(segs, n, total, lang, dubwav);
 			if (k + 1 < nlangs)
 				tpid = translate_start(src, langs[k + 1]);
