@@ -44,6 +44,9 @@ FULL_FACE = 0.15    # faces this wide count as a full close-up
 MAX_YAW = 0.55      # more turned than this: lips not readable
 LIP_LAG = 3         # frames the lips may lead the sound (~100 ms)
 STILL = 0.012       # lifetime lip motion below this: a photo or still image
+# the mouth signal: jawOpen follows the voice's 300-3000 Hz envelope about
+# 3x better than the inner-lip gap follows its loudness (r 0.20 vs 0.07)
+MOUTH = "jaw"
 
 
 def load_mono(path, rate):
@@ -247,10 +250,10 @@ class Lips:
             m = r[r[:, 1] == t]
             self.tracks[t] = {k: m[:, 2 + j] for j, k in enumerate(self.keys)}
             self.tracks[t]["frame"] = m[:, 0].astype(int)
-        # lip opening scaled per track to 0 (closed) .. 1 (wide open)
+        # mouth opening scaled per track to 0 (closed) .. 1 (wide open)
         for tr in self.tracks.values():
-            lo, hi = np.percentile(tr["open"], [5, 95])
-            tr["norm"] = np.clip((tr["open"] - lo) / max(hi - lo, 1e-3), 0, 1)
+            lo, hi = np.percentile(tr[MOUTH], [5, 95])
+            tr["norm"] = np.clip((tr[MOUTH] - lo) / max(hi - lo, 1e-3), 0, 1)
         # faces in photos and graphics: landmarks jitter, lips never move
         for t, tr in self.tracks.items():
             f = tr["frame"]
@@ -276,15 +279,15 @@ def motion(x):
 
 def active_face(lips, seg, env):
     """The face that is speaking this phrase: its lips move at syllable
-    rate and with the voice's loudness. Returns (track, score) or (None, 0).
-    env: voice loudness per video frame."""
+    rate and with the voice's envelope. Returns (track, score) or (None, 0).
+    env: voice envelope (300-3000 Hz, dB) per video frame."""
     fps = lips.fps
     f0, f1 = int(seg["start"] * fps), int(seg["end"] * fps) + 1
     best, bs = None, 0.0
     for t, tr in lips.tracks.items():
         if tr["frame"][0] >= f1 or tr["frame"][-1] < f0 or tr["still"]:
             continue
-        x = lips.series(t, "open", f0, f1)
+        x = lips.series(t, MOUTH, f0, f1)
         ok = ~np.isnan(x)
         if ok.mean() < 0.5:
             continue
@@ -367,7 +370,10 @@ def main():
     if lips:
         hop = rate / lips.fps
         nf = int(len(pcm) / hop)
-        env = np.array([10 * np.log10(np.mean(pcm[int(i * hop):int((i + 1) * hop)]
+        from scipy.signal import butter, sosfiltfilt
+        sp = sosfiltfilt(butter(4, [300, 3000], btype="band", fs=rate,
+                                output="sos"), pcm)
+        env = np.array([10 * np.log10(np.mean(sp[int(i * hop):int((i + 1) * hop)]
                                               ** 2) + 1e-10) for i in range(nf)])
         env = np.clip(env, env.max() - 50, None)
     onscreen = 0
